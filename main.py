@@ -4,6 +4,9 @@ import asyncio
 import time
 import os
 import websockets
+import requests
+import re
+from datetime import datetime, timedelta
 from loguru import logger
 from dotenv import load_dotenv, set_key
 from XianyuApis import XianyuApis
@@ -14,6 +17,7 @@ import random
 from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
 from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
+from reply_checker import RuleChecker
 
 
 class XianyuLive:
@@ -23,7 +27,8 @@ class XianyuLive:
         self.cookies_str = cookies_str
         self.cookies = trans_cookies(cookies_str)
         self.xianyu.session.cookies.update(self.cookies)  # 直接使用 session.cookies.update
-        self.myid = self.cookies['unb']
+        #self.myid = self.cookies['aui']
+        self.myid = "1095520668"
         self.device_id = generate_device_id(self.myid)
         self.context_manager = ChatContextManager()
         
@@ -56,6 +61,9 @@ class XianyuLive:
         
         # 模拟人工输入配置
         self.simulate_human_typing = os.getenv("SIMULATE_HUMAN_TYPING", "False").lower() == "true"
+
+        # 预设规则拦截层
+        self.rule_checker = RuleChecker()
 
     async def refresh_token(self):
         """刷新token"""
@@ -299,6 +307,22 @@ class XianyuLive:
         else:
             self.enter_manual_mode(chat_id)
             return "manual"
+
+    def _is_paid_message(self, message) -> bool:
+        """检查消息是否为付款成功通知"""
+        paid_keywords = [
+            '我已付款，等待你发货',
+            '已付款，待发货',
+            '记得及时发货',
+        ]
+        try:
+            reminder_content = message.get("1", {}).get("10", {}).get("reminderContent", "")
+            for keyword in paid_keywords:
+                if keyword in reminder_content:
+                    return True
+        except:
+            pass
+        return False
     
     def format_price(self, price):
         """
@@ -309,6 +333,314 @@ class XianyuLive:
         except (ValueError, TypeError):
             # 遇到 None 或脏数据，默认返回 0
             return 0.0
+
+    async def handle_auto_delivery(self, message, user_id):
+        """处理虚拟商品自动发货"""
+        try:
+            # 从消息中提取订单信息
+            reminder_url = message.get("1", {}).get("10", {}).get("reminderUrl", "")
+
+            # 提取订单ID和商品ID
+            order_id = None
+            item_id = None
+
+            # 优先从卡片数据中提取 orderId
+            card_data = message.get("1", {}).get("6", {}).get("3", {}).get("4", "")
+            if card_data:
+                try:
+                    card_json = json.loads(card_data)
+                    # 从按钮的 targetUrl 中提取 orderId
+                    button_url = card_json.get("dxCard", {}).get("button", {}).get("targetUrl", "")
+                    if "orderId=" in button_url:
+                        order_id = button_url.split("orderId=")[1].split("&")[0]
+                        logger.debug(f"从卡片按钮URL中提取到订单ID: {order_id}")
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.debug(f"解析卡片数据失败: {e}")
+
+            # 尝试从 reminderUrl 中提取
+            if not order_id:
+                if "orderId=" in reminder_url:
+                    order_id = reminder_url.split("orderId=")[1].split("&")[0]
+            if not item_id and "itemId=" in reminder_url:
+                item_id = reminder_url.split("itemId=")[1].split("&")[0]
+
+            if not order_id:
+                logger.warning(f"无法从消息中提取订单ID")
+                logger.debug(f"reminderUrl: {reminder_url}")
+                logger.debug(f"cardData: {card_data[:200] if card_data else 'None'}...")
+                return
+
+            if not item_id:
+                logger.warning(f"无法从消息中提取商品ID")
+                return
+
+            # 提取会话ID（session_id）
+            session_id = message.get("1", {}).get("2", "").split("@")[0]
+
+            # 检查是否已发货
+            if self.context_manager.is_order_delivered(order_id):
+                logger.info(f"订单 {order_id} 已发货，跳过")
+                return
+
+            logger.info(f"开始自动发货: 订单 {order_id}, 商品 {item_id}, 买家 {user_id}")
+
+            # 保存订单到本地
+            self.context_manager.save_order(order_id, item_id, user_id)
+
+            # 获取订单支付信息
+            payment_result = self.xianyu.get_order_payment_info(session_id, item_id)
+            if not payment_result.get("success"):
+                logger.error(f"获取订单支付信息失败: {order_id}")
+                return
+
+            # 提取支付金额
+            payment_data = payment_result.get("data", {})
+            middle_data = payment_data.get("middle", {}).get("data", {})
+            paid_amount = float(middle_data.get("price", 0))
+
+            logger.info(f"订单 {order_id} 支付金额: {paid_amount}")
+
+            # 从商品信息获取规格和价格，计算购买时长
+            skus = self.context_manager.get_item_skus(item_id)
+            if not skus:
+                # 从数据库获取商品信息
+                item_info = self.context_manager.get_item_info(item_id)
+                if not item_info:
+                    # 从API获取商品信息
+                    api_result = self.xianyu.get_item_info(item_id)
+                    if 'data' in api_result and 'itemDO' in api_result['data']:
+                        item_info = api_result['data']['itemDO']
+                        self.context_manager.save_item_info(item_id, item_info)
+
+                if item_info:
+                    # 解析SKU
+                    for sku in item_info.get('skuList', []):
+                        specs = [p['valueText'] for p in sku.get('propertyList', []) if p.get('valueText')]
+                        spec_text = " ".join(specs) if specs else "默认规格"
+                        sku_price = round(sku.get('price', 0) / 100, 2)
+                        sku_id = str(sku.get('skuId', ''))
+                        skus.append({"sku_id": sku_id, "spec": spec_text, "price": sku_price})
+
+            # 匹配支付金额对应的规格
+            duration_days = self._calculate_duration(paid_amount, skus)
+
+            if not duration_days:
+                logger.error(f"无法根据支付金额 {paid_amount} 计算时长")
+                return
+
+            logger.info(f"订单 {order_id} 计算购买时长: {duration_days} 天")
+
+            # 检查是否有现有token（续费场景），必须在 save_order 覆写之前读取
+            existing_order = self.context_manager.get_order(order_id)
+            token = existing_order.get("token") if existing_order else None
+
+            # 更新订单信息
+            self.context_manager.save_order(order_id, item_id, user_id, paid_amount, duration_days)
+
+            if token:
+                # 续费场景：延长token有效期
+                logger.info(f"续费场景，为token {token} 延期 {duration_days} 天")
+                token, subscribe_url, expire_date = await self._extend_token(token, duration_days)
+            else:
+                # 新购买场景：创建新token
+                logger.info(f"新购买场景，创建 {duration_days} 天有效期token")
+                token, subscribe_url, expire_date = await self._create_token(item_id, duration_days)
+
+            if not token:
+                logger.error(f"Token管理失败，订单 {order_id} 无法完成发货")
+                return
+
+            # 更新订单token
+            self.context_manager.update_order_delivered(order_id, token)
+
+            # TODO: 暂时注释掉自动发货，手动点击发货按钮
+            # 调用闲鱼发货API
+            # delivery_result = self.xianyu.auto_delivery(order_id, item_id)
+            # if delivery_result.get("success"):
+            #     logger.info(f"✅ 自动发货成功: 订单 {order_id}")
+            # else:
+            #     logger.error(f"❌ 自动发货失败: 订单 {order_id}, 错误: {delivery_result.get('error')}")
+
+            # 发送token给买家
+            await self.send_token_message(session_id, user_id, token, duration_days, subscribe_url, expire_date)
+
+        except Exception as e:
+            logger.error(f"处理自动发货时发生错误: {str(e)}")
+
+    def _calculate_duration(self, paid_amount, skus):
+        """根据支付金额和SKU计算购买时长（天数）"""
+        try:
+            # 按价格升序排列SKU
+            sorted_skus = sorted(skus, key=lambda x: x.get("price", 0))
+
+            # 精确匹配优先
+            for sku in sorted_skus:
+                if abs(sku.get("price", 0) - paid_amount) < 0.01:
+                    return self._parse_duration_from_spec(sku.get("spec", ""))
+
+            # 向下匹配（取最接近且不超过的价格对应的时长）
+            for sku in sorted_skus:
+                if sku.get("price", 0) <= paid_amount:
+                    return self._parse_duration_from_spec(sku.get("spec", ""))
+
+            return None
+        except Exception as e:
+            logger.error(f"计算时长失败: {e}")
+            return None
+
+    def _parse_duration_from_spec(self, spec):
+        """从规格文本解析时长"""
+        spec_lower = spec.lower()
+
+        # 匹配各种时长格式
+        patterns = [
+            (r"1\s*年|一年|12\s*个月|12\s*月", 365),
+            (r"2\s*年|两年|24\s*个月|24\s*月", 730),
+            (r"6\s*个月|半年|6\s*月", 180),
+            (r"(\d+)\s*天", lambda m: int(m.group(1))),
+            (r"(\d+)\s*个月", lambda m: int(m.group(1)) * 30),
+            (r"月卡", 30),
+            (r"季卡|季度", 90),
+        ]
+
+        for pattern, result in patterns:
+            match = re.search(pattern, spec_lower)
+            if match:
+                if callable(result):
+                    return result(match)
+                return result
+
+        return None
+
+    async def _create_token(self, item_id, expire_days):
+        """调用token管理系统创建token"""
+        try:
+            api_url = os.getenv("TOKEN_API_URL", "http://localhost:8100/api.php")
+            api_key = os.getenv("TOKEN_API_KEY", "your_api_key_here")
+
+            payload = {
+                "action": "create_token",
+                "playlist_ids": [2],
+                "expire_days": expire_days,
+                "channel": "xianyu_auto",
+                "max_ip_per_day": 4
+            }
+
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(api_url, json=payload, headers=headers, timeout=30)
+            result = response.json()
+
+            if result.get("success") or result.get("code") == 0:
+                token = result.get("data", {}).get("token") or result.get("token")
+                subscribe_url = result.get("data", {}).get("subscribe_url", "")
+                expire_date = result.get("data", {}).get("expire_date", "")
+                logger.info(f"Token延期成功: {token} +{expire_days}天，过期时间：{expire_date}")
+                logger.info(f"订阅链接: {subscribe_url}")
+                return (token, subscribe_url, expire_date)
+            else:
+                logger.error(f"Token创建失败: {result}")
+                return (None, None, None)
+
+        except Exception as e:
+            logger.error(f"创建Token异常: {str(e)}")
+            return (None, None, None)
+
+    async def _extend_token(self, token, add_days):
+        """调用token管理系统延期token，返回 (token, subscribe_url)"""
+        try:
+            api_url = os.getenv("TOKEN_API_URL", "http://localhost:8100/api.php")
+            api_key = os.getenv("TOKEN_API_KEY", "your_api_key_here")
+
+            payload = {
+                "action": "update_token",
+                "token": token,
+                "add_days": add_days,
+                "status": 1
+            }
+
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(api_url, json=payload, headers=headers, timeout=30)
+            result = response.json()
+
+            if result.get("success") or result.get("code") == 0:
+                # 延期成功后，生成订阅链接
+                subscribe_url = result.get("data", {}).get("subscribe_url", "")
+                expire_date = result.get("data", {}).get("expire_date", "")
+                logger.info(f"Token延期成功: {token} +{add_days}天，过期时间：{expire_date}")
+                logger.info(f"订阅链接: {subscribe_url}")
+                return (token, subscribe_url, expire_date)
+            else:
+                logger.error(f"Token延期失败: {result}")
+                return (None, None, None)
+
+        except Exception as e:
+            logger.error(f"延期Token异常: {str(e)}")
+            return (None, None, None)
+
+    async def send_token_message(self, chat_id, user_id, token, duration_days, subscribe_url, expire_date):
+        """发送token给买家（拆分成4条消息）"""
+        try:
+            # 消息1：有效期
+            msg1 = f"📅 有效期：{duration_days} 天（至 {expire_date} 到期）"
+
+            # 消息2：订阅链接
+            msg2 = f"🔗 订阅地址：\n{subscribe_url}"
+
+            # 消息3：售后服务说明
+            msg3 = """👆🏻将上方源地址添加到订阅就行，不要用🪜。
+
+关于售后：
+1、免费试用：
+下单后的 12小时内 为免费试用期。如不满，请联系我为您关闭订单，不会产生任何费用。
+⭕️⭕️不要自己点退款，不满意联系我来关闭订单
+⭕️⭕️不要自己点退款，不满意联系我来关闭订单
+2、支持随时退款：
+📦🔙月卡退款规则
+每3天为一个扣费周期。每月扣除金额为卡价格的1/10。
+退款金额 = 月卡价格 - (月卡价格 ÷ 10 × 已使用天数 ÷ 3)
+📦🔙半年/年卡退款规则
+年卡按对应的月度费用计算已使用部分，不足一个月按一个月计算。
+退款金额 = 年卡价格 - (月卡销售价格 × 已使用整月数)
+
+❗本产品为个人订阅❗严禁多设备❗严禁频繁切换网络❗严禁传播，否则将被限制
+
+❗❗对同行、中差评、骚扰等行为，将直接拉黑封卡。
+
+[沙发]兼容大部分APP，
+安卓全设备推荐：OK影视 app
+苹果全设备推荐：APTV app
+Windows安装PotPlayer（体验没有电视好）或者安卓模拟器使用。
+
+配置教程：http://154.64.255.221:5080/doc/jc/index.html
+（使用前请先查看，节省时间和操作难度）"""
+
+            # 消息4：常见问题处理
+            msg4 = """[挥手]部分app会遇到无法播放的情况，需到设置中将User-Agent改为
+
+okhttp/3.12.1"""
+
+            # 依次发送消息，每条间隔0.5秒
+            await self.send_msg(self.ws, chat_id, user_id, msg1)
+            await asyncio.sleep(0.5)
+            await self.send_msg(self.ws, chat_id, user_id, msg2)
+            await asyncio.sleep(0.5)
+            await self.send_msg(self.ws, chat_id, user_id, msg3)
+            await asyncio.sleep(0.5)
+            await self.send_msg(self.ws, chat_id, user_id, msg4)
+
+            logger.info(f"Token消息已发送: Token={token[:16]}...")
+            logger.info(f"会话ID：{chat_id},订阅链接: {subscribe_url}")
+
+        except Exception as e:
+            logger.error(f"发送Token消息失败: {str(e)}")
     
     def build_item_description(self, item_info):
         """构建商品描述"""
@@ -405,23 +737,26 @@ class XianyuLive:
                 return
 
             try:
-                # 判断是否为订单消息,需要自行编写付款后的逻辑
-                if message['3']['redReminder'] == '等待买家付款':
-                    user_id = message['1'].split('@')[0]
-                    user_url = f'https://www.goofish.com/personal?userId={user_id}'
+                # 判断是否为订单消息
+                user_id = message['1'].split('@')[0]
+                user_url = f'https://www.goofish.com/personal?userId={user_id}'
+                red_reminder = message['3'].get('redReminder', '')
+
+                if red_reminder == '等待买家付款':
                     logger.info(f'等待买家 {user_url} 付款')
                     return
-                elif message['3']['redReminder'] == '交易关闭':
-                    user_id = message['1'].split('@')[0]
-                    user_url = f'https://www.goofish.com/personal?userId={user_id}'
+                elif red_reminder == '交易关闭':
                     logger.info(f'买家 {user_url} 交易关闭')
                     return
-                elif message['3']['redReminder'] == '等待卖家发货':
-                    user_id = message['1'].split('@')[0]
-                    user_url = f'https://www.goofish.com/personal?userId={user_id}'
-                    logger.info(f'交易成功 {user_url} 等待卖家发货')
-                    return
 
+                # 付款消息单独数据结构
+                red_reminder = message['10'].get('redReminder', '')
+                if red_reminder == '等待卖家发货' or self._is_paid_message(message):
+                    logger.info(f'交易成功 {user_url} 等待卖家发货')
+
+                    # 自动发货处理
+                    await self.handle_auto_delivery(message, user_id)
+                    return
             except:
                 pass
 
@@ -466,6 +801,12 @@ class XianyuLive:
                     else:
                         logger.info(f"🟢 已恢复会话 {chat_id} 的自动回复 (商品: {item_id})")
                     return
+
+                # 热重载预设规则
+                if send_message.strip() == "#reload_rules":
+                    self.rule_checker.reload()
+                    logger.info("[规则热重载] 卖家触发规则重载成功")
+                    return
                 
                 # 记录卖家人工回复
                 self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", send_message)
@@ -507,6 +848,32 @@ class XianyuLive:
             
             # 获取完整的对话上下文
             context = self.context_manager.get_context_by_chat(chat_id)
+
+            # 预设规则拦截层（命中则跳过 LLM 调用，减少LLM调用次数）
+            rule_replies = self.rule_checker.match(send_message)
+            if rule_replies:
+                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
+
+                # 计算总消息长度（用于延迟计算）
+                total_length = sum(len(msg) for msg in rule_replies)
+
+                # 添加所有回复到上下文
+                for reply in rule_replies:
+                    self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", reply)
+
+                if self.simulate_human_typing:
+                    base_delay = random.uniform(0, 1)
+                    typing_delay = total_length * random.uniform(0.1, 0.3)
+                    await asyncio.sleep(min(base_delay + typing_delay, 10.0))
+
+                # 发送每条消息（多条消息间有短暂延迟）
+                for i, reply in enumerate(rule_replies):
+                    await self.send_msg(websocket, chat_id, send_user_id, reply)
+                    if i < len(rule_replies) - 1:
+                        await asyncio.sleep(0.5)  # 多条消息间间隔 0.5 秒
+
+                return
+
             # 生成回复
             bot_reply = bot.generate_reply(
                 send_message,

@@ -87,7 +87,54 @@ class ChatContextManager:
             last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         ''')
-        
+
+        # 检查是否需要添加 is_multi_sku 字段（兼容旧数据库）
+        cursor.execute("PRAGMA table_info(items)")
+        item_columns = [col[1] for col in cursor.fetchall()]
+        if 'is_multi_sku' not in item_columns:
+            cursor.execute('ALTER TABLE items ADD COLUMN is_multi_sku INTEGER DEFAULT 0')
+            logger.info("已为 items 表添加 is_multi_sku 字段")
+
+        # 创建商品规格表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS item_skus (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id TEXT NOT NULL,
+            sku_id TEXT,
+            spec TEXT NOT NULL,
+            price REAL NOT NULL,
+            stock INTEGER DEFAULT 0,
+            FOREIGN KEY (item_id) REFERENCES items(item_id)
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_item_skus_item_id ON item_skus (item_id)
+        ''')
+
+        # 创建订单表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            buyer_id TEXT NOT NULL,
+            paid_amount REAL,
+            duration_days INTEGER,
+            token TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            delivered_at DATETIME
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_orders_item_id ON orders (item_id)
+        ''')
+
+        cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_orders_buyer_id ON orders (buyer_id)
+        ''')
+
         conn.commit()
         conn.close()
         logger.info(f"聊天历史数据库初始化完成: {self.db_path}")
@@ -97,37 +144,65 @@ class ChatContextManager:
     def save_item_info(self, item_id, item_data):
         """
         保存商品信息到数据库
-        
+
         Args:
             item_id: 商品ID
             item_data: 商品信息字典
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         try:
             # 从商品数据中提取有用信息
             price = float(item_data.get('soldPrice', 0))
             description = item_data.get('desc', '')
-            
+
+            # 解析 SKU 列表
+            sku_rows = []
+            raw_sku_list = item_data.get('skuList', [])
+            for sku in raw_sku_list:
+                specs = [p['valueText'] for p in sku.get('propertyList', []) if p.get('valueText')]
+                spec_text = " ".join(specs) if specs else "默认规格"
+                sku_price = round(sku.get('price', 0) / 100, 2)
+                sku_stock = sku.get('quantity', 0)
+                sku_id = str(sku.get('skuId', ''))
+                sku_rows.append((item_id, sku_id, spec_text, sku_price, sku_stock))
+
+            # 判断是否多规格：minPrice != maxPrice
+            try:
+                min_price = float(item_data.get('minPrice', price))
+                max_price = float(item_data.get('maxPrice', price))
+                is_multi_sku = 1 if min_price != max_price else 0
+            except (TypeError, ValueError):
+                is_multi_sku = 0
+
             # 将整个商品数据转换为JSON字符串
             data_json = json.dumps(item_data, ensure_ascii=False)
-            
+            now = datetime.now().isoformat()
+
             cursor.execute(
                 """
-                INSERT INTO items (item_id, data, price, description, last_updated) 
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(item_id) 
-                DO UPDATE SET data = ?, price = ?, description = ?, last_updated = ?
+                INSERT INTO items (item_id, data, price, description, is_multi_sku, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(item_id)
+                DO UPDATE SET data = ?, price = ?, description = ?, is_multi_sku = ?, last_updated = ?
                 """,
                 (
-                    item_id, data_json, price, description, datetime.now().isoformat(),
-                    data_json, price, description, datetime.now().isoformat()
+                    item_id, data_json, price, description, is_multi_sku, now,
+                    data_json, price, description, is_multi_sku, now
                 )
             )
-            
+
+            # 先清除旧 SKU，再批量插入
+            cursor.execute("DELETE FROM item_skus WHERE item_id = ?", (item_id,))
+            if sku_rows:
+                cursor.executemany(
+                    "INSERT INTO item_skus (item_id, sku_id, spec, price, stock) VALUES (?, ?, ?, ?, ?)",
+                    sku_rows
+                )
+
             conn.commit()
-            logger.debug(f"商品信息已保存: {item_id}")
+            logger.debug(f"商品信息已保存: {item_id}, 多规格: {bool(is_multi_sku)}, SKU 数量: {len(sku_rows)}")
         except Exception as e:
             logger.error(f"保存商品信息时出错: {e}")
             conn.rollback()
@@ -160,6 +235,34 @@ class ChatContextManager:
         except Exception as e:
             logger.error(f"获取商品信息时出错: {e}")
             return None
+        finally:
+            conn.close()
+
+    def get_item_skus(self, item_id):
+        """
+        获取商品的规格列表
+
+        Args:
+            item_id: 商品ID
+
+        Returns:
+            list: SKU 列表，每项包含 sku_id / spec / price / stock；不存在时返回空列表
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                "SELECT sku_id, spec, price, stock FROM item_skus WHERE item_id = ? ORDER BY id ASC",
+                (item_id,)
+            )
+            return [
+                {"sku_id": row[0], "spec": row[1], "price": row[2], "stock": row[3]}
+                for row in cursor.fetchall()
+            ]
+        except Exception as e:
+            logger.error(f"获取商品规格时出错: {e}")
+            return []
         finally:
             conn.close()
 
@@ -306,4 +409,114 @@ class ChatContextManager:
             logger.error(f"获取议价次数时出错: {e}")
             return 0
         finally:
-            conn.close() 
+            conn.close()
+
+    def save_order(self, order_id, item_id, buyer_id, paid_amount=None, duration_days=None):
+        """
+        保存订单信息
+
+        Args:
+            order_id: 订单ID
+            item_id: 商品ID
+            buyer_id: 买家ID
+            paid_amount: 支付金额
+            duration_days: 时长（天数）
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO orders (order_id, item_id, buyer_id, paid_amount, duration_days, status)
+                VALUES (?, ?, ?, ?, ?, 'pending')
+                """,
+                (order_id, item_id, buyer_id, paid_amount, duration_days)
+            )
+            conn.commit()
+            logger.debug(f"订单已保存: {order_id}")
+        except Exception as e:
+            logger.error(f"保存订单时出错: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def get_order(self, order_id):
+        """
+        获取订单信息
+
+        Args:
+            order_id: 订单ID
+
+        Returns:
+            dict: 订单信息，不存在返回None
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                "SELECT order_id, item_id, buyer_id, paid_amount, duration_days, token, status, created_at, delivered_at FROM orders WHERE order_id = ?",
+                (order_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "order_id": row[0],
+                    "item_id": row[1],
+                    "buyer_id": row[2],
+                    "paid_amount": row[3],
+                    "duration_days": row[4],
+                    "token": row[5],
+                    "status": row[6],
+                    "created_at": row[7],
+                    "delivered_at": row[8]
+                }
+            return None
+        except Exception as e:
+            logger.error(f"获取订单时出错: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def update_order_delivered(self, order_id, token):
+        """
+        更新订单为已发货状态
+
+        Args:
+            order_id: 订单ID
+            token: 生成的token
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                """
+                UPDATE orders SET status = 'delivered', token = ?, delivered_at = ?
+                WHERE order_id = ?
+                """,
+                (token, datetime.now().isoformat(), order_id)
+            )
+            conn.commit()
+            logger.info(f"订单已更新为已发货: {order_id}")
+        except Exception as e:
+            logger.error(f"更新订单状态时出错: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def is_order_delivered(self, order_id):
+        """
+        检查订单是否已发货
+
+        Args:
+            order_id: 订单ID
+
+        Returns:
+            bool: 是否已发货
+        """
+        order = self.get_order(order_id)
+        if order:
+            return order.get("status") == "delivered"
+        return False 

@@ -3,6 +3,7 @@ from typing import List, Dict
 import os
 from openai import OpenAI
 from loguru import logger
+import time
 
 
 class XianyuReplyBot:
@@ -81,8 +82,9 @@ class XianyuReplyBot:
         # logger.debug(f'对话历史: {formatted_context}')
         
         # 1. 路由决策
+        _router_start = time.time()
         detected_intent = self.router.detect(user_msg, item_desc, formatted_context)
-
+        logger.info(f"意图识别: {time.time() - _router_start:.2f}s")
 
 
         # 2. 获取对应Agent
@@ -190,7 +192,7 @@ class IntentRouter:
                     return intent
         
         # 4. 大模型兜底
-        # logger.debug("使用大模型进行意图分类")
+        logger.debug("使用大模型进行意图分类")
         return self.classify_agent.generate(
             user_msg=user_msg,
             item_desc=item_desc,
@@ -209,7 +211,9 @@ class BaseAgent:
     def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int = 0) -> str:
         """生成回复模板方法"""
         messages = self._build_messages(user_msg, item_desc, context)
+        _generate_start = time.time()
         response = self._call_llm(messages)
+        logger.info(f"大模型调用耗时: {time.time() - _generate_start:.2f}s")
         return self.safety_filter(response)
 
     def _build_messages(self, user_msg: str, item_desc: str, context: str) -> List[Dict]:
@@ -240,6 +244,7 @@ class PriceAgent(BaseAgent):
         messages = self._build_messages(user_msg, item_desc, context)
         messages[0]['content'] += f"\n▲当前议价轮次：{bargain_count}"
 
+        _generate_start = time.time()
         response = self.client.chat.completions.create(
             model=os.getenv("MODEL_NAME", "qwen-max"),
             messages=messages,
@@ -247,6 +252,7 @@ class PriceAgent(BaseAgent):
             max_tokens=500,
             top_p=0.8
         )
+        logger.info(f"[PriceAgent] 大模型调用耗时: {time.time() - _generate_start:.2f}s")
         return self.safety_filter(response.choices[0].message.content)
 
     def _calc_temperature(self, bargain_count: int) -> float:
@@ -261,6 +267,10 @@ class TechAgent(BaseAgent):
         messages = self._build_messages(user_msg, item_desc, context)
         # messages[0]['content'] += "\n▲知识库：\n" + self._fetch_tech_specs()
 
+        logger.debug(f"[TechAgent] 请求消息长度: {len(str(messages))}")
+        logger.debug(f"[TechAgent] 用户消息: {user_msg}")
+
+        _generate_start = time.time()
         response = self.client.chat.completions.create(
             model=os.getenv("MODEL_NAME", "qwen-max"),
             messages=messages,
@@ -268,9 +278,13 @@ class TechAgent(BaseAgent):
             max_tokens=500,
             top_p=0.8,
             extra_body={
-                "enable_search": True,
+                "thinking": {"type": "off"}  # 关闭思考模式，避免推理耗时
             }
         )
+        _elapsed = time.time() - _generate_start
+        logger.info(f"[TechAgent] 大模型调用耗时: {_elapsed:.2f}s")
+        logger.debug(f"[TechAgent] 响应usage: {response.usage}")
+        logger.debug(f"[TechAgent] 实际响应model: {response.model}")
 
         return self.safety_filter(response.choices[0].message.content)
 

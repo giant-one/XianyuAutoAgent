@@ -2,6 +2,7 @@ import time
 import os
 import re
 import sys
+import json
 
 import requests
 from loguru import logger
@@ -317,3 +318,178 @@ class XianyuApis:
             logger.error(f"商品信息API请求异常: {str(e)}")
             time.sleep(0.5)
             return self.get_item_info(item_id, retry_count + 1)
+
+    def auto_delivery(self, order_id, item_id, retry_count=0):
+        """虚拟商品自动发货"""
+        if retry_count >= 3:
+            logger.error("自动发货失败，重试次数过多")
+            return {"error": "自动发货失败，重试次数过多"}
+
+        params = {
+            'jsv': '2.7.2',
+            'appKey': '34839810',
+            't': str(int(time.time()) * 1000),
+            'sign': '',
+            'v': '1.0',
+            'type': 'originaljson',
+            'accountSite': 'xianyu',
+            'dataType': 'json',
+            'timeout': '20000',
+            'api': 'mtop.taobao.idle.order.send',
+            'sessionOption': 'AutoLoginOnly',
+            'spm_cnt': 'a21ybx.im.0.0',
+        }
+
+        data_val = json.dumps({
+            "orderId": str(order_id),
+            "itemId": str(item_id),
+            "type": 1  # 1=无需物流（虚拟商品）
+        })
+
+        data = {
+            'data': data_val,
+        }
+
+        token = self.session.cookies.get('_m_h5_tk', '').split('_')[0]
+        sign = generate_sign(params['t'], token, data_val)
+        params['sign'] = sign
+
+        try:
+            response = self.session.post(
+                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.order.send/1.0/',
+                params=params,
+                data=data
+            )
+
+            res_json = response.json()
+
+            if isinstance(res_json, dict):
+                ret_value = res_json.get('ret', [])
+                if any('SUCCESS::调用成功' in ret for ret in ret_value):
+                    logger.info(f"自动发货成功: 订单 {order_id}")
+                    return {"success": True, "data": res_json.get('data', {})}
+                else:
+                    logger.warning(f"自动发货API调用失败: {ret_value}")
+                    return self.auto_delivery(order_id, item_id, retry_count + 1)
+            else:
+                logger.error(f"自动发货API返回格式异常: {res_json}")
+                return self.auto_delivery(order_id, item_id, retry_count + 1)
+
+        except Exception as e:
+            logger.error(f"自动发货API请求异常: {str(e)}")
+            time.sleep(0.5)
+            return self.auto_delivery(order_id, item_id, retry_count + 1)
+
+    def get_order_info(self, order_id, retry_count=0):
+        """获取订单信息"""
+        if retry_count >= 3:
+            logger.error("获取订单信息失败，重试次数过多")
+            return {"error": "获取订单信息失败"}
+
+        params = {
+            'jsv': '2.7.2',
+            'appKey': '34839810',
+            't': str(int(time.time()) * 1000),
+            'sign': '',
+            'v': '1.0',
+            'type': 'originaljson',
+            'accountSite': 'xianyu',
+            'dataType': 'json',
+            'timeout': '20000',
+            'api': 'mtop.taobao.idle.order.detail',
+            'sessionOption': 'AutoLoginOnly',
+            'spm_cnt': 'a21ybx.im.0.0',
+        }
+
+        data_val = json.dumps({"orderId": str(order_id)})
+        data = {'data': data_val}
+
+        token = self.session.cookies.get('_m_h5_tk', '').split('_')[0]
+        sign = generate_sign(params['t'], token, data_val)
+        params['sign'] = sign
+
+        try:
+            response = self.session.post(
+                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.order.detail/1.0/',
+                params=params,
+                data=data
+            )
+
+            res_json = response.json()
+
+            if isinstance(res_json, dict):
+                ret_value = res_json.get('ret', [])
+                if any('SUCCESS::调用成功' in ret for ret in ret_value):
+                    logger.info(f"订单信息获取成功: {order_id}")
+                    return {"success": True, "data": res_json.get('data', {})}
+                else:
+                    logger.warning(f"订单信息API调用失败: {ret_value}")
+                    return self.get_order_info(order_id, retry_count + 1)
+            else:
+                logger.error(f"订单信息API返回格式异常: {res_json}")
+                return self.get_order_info(order_id, retry_count + 1)
+
+        except Exception as e:
+            logger.error(f"订单信息API请求异常: {str(e)}")
+            time.sleep(0.5)
+            return self.get_order_info(order_id, retry_count + 1)
+
+    def get_order_payment_info(self, session_id, item_id, retry_count=0):
+        """获取订单支付信息（包含支付金额）"""
+        if retry_count >= 3:
+            logger.error("获取订单支付信息失败，重试次数过多")
+            return {"error": "获取订单支付信息失败"}
+
+        params = {
+            'jsv': '2.7.2',
+            'appKey': '34839810',
+            't': str(int(time.time()) * 1000),
+            'sign': '',
+            'v': '1.0',
+            'type': 'json',
+            'valueType': 'string',
+            'accountSite': 'xianyu',
+            'dataType': 'json',
+            'timeout': '20000',
+            'api': 'mtop.idle.trade.pc.message.headinfo',
+            'sessionOption': 'AutoLoginOnly',
+            'spm_cnt': 'a21ybx.im.0.0',
+        }
+
+        data_val = json.dumps({
+            "itemId": str(item_id),
+            "sessionId": str(session_id),
+            "sessionType": 1
+        })
+
+        data = {'data': data_val}
+
+        token = self.session.cookies.get('_m_h5_tk', '').split('_')[0]
+        sign = generate_sign(params['t'], token, data_val)
+        params['sign'] = sign
+
+        try:
+            response = self.session.post(
+                'https://h5api.m.goofish.com/h5/mtop.idle.trade.pc.message.headinfo/1.0/',
+                params=params,
+                data=data
+            )
+
+            res_json = response.json()
+
+            if isinstance(res_json, dict):
+                ret_value = res_json.get('ret', [])
+                if any('SUCCESS::调用成功' in ret for ret in ret_value):
+                    logger.info(f"订单支付信息获取成功: {session_id}")
+                    return {"success": True, "data": res_json.get('data', {})}
+                else:
+                    logger.warning(f"订单支付信息API调用失败: {ret_value}")
+                    return self.get_order_payment_info(session_id, item_id, retry_count + 1)
+            else:
+                logger.error(f"订单支付信息API返回格式异常: {res_json}")
+                return self.get_order_payment_info(session_id, item_id, retry_count + 1)
+
+        except Exception as e:
+            logger.error(f"订单支付信息API请求异常: {str(e)}")
+            time.sleep(0.5)
+            return self.get_order_payment_info(session_id, item_id, retry_count + 1)

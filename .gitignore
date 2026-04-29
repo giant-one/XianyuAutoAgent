@@ -2,6 +2,7 @@
 .env
 # 提示词文件
 *_prompt.txt
+rules.json
 # Python缓存文件
 __pycache__/
 *.py[cod]
@@ -33,6 +34,7 @@ env/
 # 日志文件
 logs/
 *.log
+nohup.out
 
 # 数据库文件
 *.db
@@ -51,4 +53,4 @@ htmlcov/
 .tox/
 .nox/
 .hypothesis/
-.coverage.* 
+.coverage.*
