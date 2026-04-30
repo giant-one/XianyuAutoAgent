@@ -335,6 +335,7 @@ class XianyuLive:
             return 0.0
 
     async def handle_auto_delivery(self, message, user_id):
+        logger.debug(f"自动发货message原始信息: {message}")
         """处理虚拟商品自动发货"""
         try:
             # 从消息中提取订单信息
@@ -345,15 +346,22 @@ class XianyuLive:
             item_id = None
 
             # 优先从卡片数据中提取 orderId
-            card_data = message.get("1", {}).get("6", {}).get("3", {}).get("4", "")
+            card_data = message.get("1", {}).get("6", {}).get("3", {}).get("5", "")
             if card_data:
                 try:
                     card_json = json.loads(card_data)
-                    # 从按钮的 targetUrl 中提取 orderId
-                    button_url = card_json.get("dxCard", {}).get("button", {}).get("targetUrl", "")
+                    # 从 main.exContent.button.targetUrl 中提取 orderId
+                    button_url = card_json.get("dxCard", {}).get("item", {}).get("main", {}).get("exContent", {}).get("button", {}).get("targetUrl", "")
+                    if not button_url:
+                        # 备用: 从 main.exContent.targetUrl 中提取
+                        button_url = card_json.get("dxCard", {}).get("item", {}).get("main", {}).get("exContent", {}).get("targetUrl", "")
                     if "orderId=" in button_url:
                         order_id = button_url.split("orderId=")[1].split("&")[0]
-                        logger.debug(f"从卡片按钮URL中提取到订单ID: {order_id}")
+                        logger.debug(f"从卡片URL中提取到订单ID: {order_id}")
+                    elif "id=" in button_url:
+                        # 备用格式: fleamarket://order_detail?id=xxx
+                        order_id = button_url.split("id=")[1].split("&")[0]
+                        logger.debug(f"从卡片URL中提取到订单ID: {order_id}")
                 except (json.JSONDecodeError, KeyError) as e:
                     logger.debug(f"解析卡片数据失败: {e}")
 
@@ -377,15 +385,12 @@ class XianyuLive:
             # 提取会话ID（session_id）
             session_id = message.get("1", {}).get("2", "").split("@")[0]
 
-            # 检查是否已发货
-            if self.context_manager.is_order_delivered(order_id):
-                logger.info(f"订单 {order_id} 已发货，跳过")
+            # 检查是否已发货（通过检查是否已有token）
+            if self.context_manager.has_order_token(order_id):
+                logger.info(f"订单 {order_id} 已发货（已有token），跳过")
                 return
 
             logger.info(f"开始自动发货: 订单 {order_id}, 商品 {item_id}, 买家 {user_id}")
-
-            # 保存订单到本地
-            self.context_manager.save_order(order_id, item_id, user_id)
 
             # 获取订单支付信息
             payment_result = self.xianyu.get_order_payment_info(session_id, item_id)
@@ -430,12 +435,9 @@ class XianyuLive:
 
             logger.info(f"订单 {order_id} 计算购买时长: {duration_days} 天")
 
-            # 检查是否有现有token（续费场景），必须在 save_order 覆写之前读取
-            existing_order = self.context_manager.get_order(order_id)
+            # 检查是否有现有token（续费场景，使用 user_id + item_id 查询）
+            existing_order = self.context_manager.get_order_by_user_and_item(user_id, item_id)
             token = existing_order.get("token") if existing_order else None
-
-            # 更新订单信息
-            self.context_manager.save_order(order_id, item_id, user_id, paid_amount, duration_days)
 
             if token:
                 # 续费场景：延长token有效期
@@ -450,7 +452,10 @@ class XianyuLive:
                 logger.error(f"Token管理失败，订单 {order_id} 无法完成发货")
                 return
 
-            # 更新订单token
+            # 先保存订单基本信息（确保订单存在）
+            self.context_manager.save_order(order_id, item_id, user_id, paid_amount, duration_days)
+
+            # 更新订单token并标记为已发货
             self.context_manager.update_order_delivered(order_id, token)
 
             # TODO: 暂时注释掉自动发货，手动点击发货按钮
@@ -463,6 +468,8 @@ class XianyuLive:
 
             # 发送token给买家
             await self.send_token_message(session_id, user_id, token, duration_days, subscribe_url, expire_date)
+
+            logger.info(f"自动发货完成: 订单 {order_id}, 时长 {duration_days} 天")
 
         except Exception as e:
             logger.error(f"处理自动发货时发生错误: {str(e)}")
@@ -517,7 +524,8 @@ class XianyuLive:
         try:
             api_url = os.getenv("TOKEN_API_URL", "http://localhost:8100/api.php")
             api_key = os.getenv("TOKEN_API_KEY", "your_api_key_here")
-
+            logger.debug(f"api_url:{api_url}")
+            logger.debug(f"api_key:{api_key}")
             payload = {
                 "action": "create_token",
                 "playlist_ids": [2],
@@ -736,11 +744,23 @@ okhttp/3.12.1"""
                 logger.error(f"消息解密失败: {e}")
                 return
 
+            logger.info(f'收到消息： {message}')
             try:
-                # 判断是否为订单消息
-                user_id = message['1'].split('@')[0]
+                # 兼容两种消息格式
+                if isinstance(message['1'], str):
+                    # 旧格式：message['1'] 是字符串 '60654073174@goofish'
+                    user_id = message['1'].split('@')[0]
+                    # 兼容 message['3'] 可能是整数或其他类型的情况
+                    if isinstance(message.get('3'), dict):
+                        red_reminder = message['3'].get('redReminder', '')
+                    else:
+                        red_reminder = ''
+                else:
+                    # 新格式：message['1'] 是字典
+                    user_id = message['1']['10'].get('senderUserId', '').split('@')[0]
+                    red_reminder = message['1']['10'].get('redReminder', '')
+
                 user_url = f'https://www.goofish.com/personal?userId={user_id}'
-                red_reminder = message['3'].get('redReminder', '')
 
                 if red_reminder == '等待买家付款':
                     logger.info(f'等待买家 {user_url} 付款')
@@ -749,16 +769,15 @@ okhttp/3.12.1"""
                     logger.info(f'买家 {user_url} 交易关闭')
                     return
 
-                # 付款消息单独数据结构
-                red_reminder = message['10'].get('redReminder', '')
+                # 付款消息处理
                 if red_reminder == '等待卖家发货' or self._is_paid_message(message):
                     logger.info(f'交易成功 {user_url} 等待卖家发货')
 
                     # 自动发货处理
                     await self.handle_auto_delivery(message, user_id)
                     return
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"处理消息时发生异常: {e}", exc_info=True)
 
             # 判断消息类型
             if self.is_typing_status(message):
@@ -868,6 +887,7 @@ okhttp/3.12.1"""
 
                 # 发送每条消息（多条消息间有短暂延迟）
                 for i, reply in enumerate(rule_replies):
+                    await asyncio.sleep(1)
                     await self.send_msg(websocket, chat_id, send_user_id, reply)
                     if i < len(rule_replies) - 1:
                         await asyncio.sleep(0.5)  # 多条消息间间隔 0.5 秒

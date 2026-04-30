@@ -426,15 +426,33 @@ class ChatContextManager:
         cursor = conn.cursor()
 
         try:
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO orders (order_id, item_id, buyer_id, paid_amount, duration_days, status)
-                VALUES (?, ?, ?, ?, ?, 'pending')
-                """,
-                (order_id, item_id, buyer_id, paid_amount, duration_days)
-            )
+            # 检查订单是否已存在
+            cursor.execute("SELECT status FROM orders WHERE order_id = ?", (order_id,))
+            existing = cursor.fetchone()
+
+            if existing:
+                # 订单已存在，只更新需要更新的字段，保留 status、token、created_at、delivered_at
+                cursor.execute(
+                    """
+                    UPDATE orders
+                    SET item_id = ?, buyer_id = ?, paid_amount = ?, duration_days = ?
+                    WHERE order_id = ?
+                    """,
+                    (item_id, buyer_id, paid_amount, duration_days, order_id)
+                )
+                logger.debug(f"订单已更新: {order_id}")
+            else:
+                # 订单不存在，插入新记录
+                cursor.execute(
+                    """
+                    INSERT INTO orders (order_id, item_id, buyer_id, paid_amount, duration_days, status)
+                    VALUES (?, ?, ?, ?, ?, 'pending')
+                    """,
+                    (order_id, item_id, buyer_id, paid_amount, duration_days)
+                )
+                logger.debug(f"订单已创建: {order_id}")
+
             conn.commit()
-            logger.debug(f"订单已保存: {order_id}")
         except Exception as e:
             logger.error(f"保存订单时出错: {e}")
             conn.rollback()
@@ -519,4 +537,62 @@ class ChatContextManager:
         order = self.get_order(order_id)
         if order:
             return order.get("status") == "delivered"
-        return False 
+        return False
+
+    def has_order_token(self, order_id):
+        """
+        检查订单是否已有token（用于判断是否已处理）
+
+        Args:
+            order_id: 订单ID
+
+        Returns:
+            bool: 是否有token
+        """
+        order = self.get_order(order_id)
+        return order is not None and bool(order.get("token"))
+
+    def get_order_by_user_and_item(self, user_id, item_id):
+        """
+        根据用户ID和商品ID查询订单（用于判断续费场景）
+
+        Args:
+            user_id: 用户ID
+            item_id: 商品ID
+
+        Returns:
+            dict: 订单信息，不存在返回None
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                """
+                SELECT order_id, item_id, buyer_id, paid_amount, duration_days, token, status, created_at, delivered_at
+                FROM orders
+                WHERE buyer_id = ? AND item_id = ? AND token IS NOT NULL AND token != ''
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (user_id, item_id)
+            )
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "order_id": row[0],
+                    "item_id": row[1],
+                    "buyer_id": row[2],
+                    "paid_amount": row[3],
+                    "duration_days": row[4],
+                    "token": row[5],
+                    "status": row[6],
+                    "created_at": row[7],
+                    "delivered_at": row[8]
+                }
+            return None
+        except Exception as e:
+            logger.error(f"查询用户商品订单时出错: {e}")
+            return None
+        finally:
+            conn.close() 
