@@ -266,6 +266,30 @@ class ChatContextManager:
         finally:
             conn.close()
 
+    def is_item_multi_sku(self, item_id):
+        """
+        检查商品是否为多规格商品
+
+        Args:
+            item_id: 商品ID
+
+        Returns:
+            bool: True 为多规格，False 为单规格
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT is_multi_sku FROM items WHERE item_id = ?", (item_id,))
+            result = cursor.fetchone()
+            if result:
+                return bool(result[0])
+            return False
+        except Exception as e:
+            logger.error(f"检查商品多规格状态出错: {e}")
+            return False
+        finally:
+            conn.close()
+
     def add_message_by_chat(self, chat_id, user_id, item_id, role, content):
         """
         基于会话ID添加新消息到对话历史

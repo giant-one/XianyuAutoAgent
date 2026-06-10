@@ -407,6 +407,7 @@ class XianyuLive:
 
             # 从商品信息获取规格和价格，计算购买时长
             skus = self.context_manager.get_item_skus(item_id)
+            item_info = None
             if not skus:
                 # 从数据库获取商品信息
                 item_info = self.context_manager.get_item_info(item_id)
@@ -426,8 +427,14 @@ class XianyuLive:
                         sku_id = str(sku.get('skuId', ''))
                         skus.append({"sku_id": sku_id, "spec": spec_text, "price": sku_price})
 
-            # 匹配支付金额对应的规格
-            duration_days = self._calculate_duration(paid_amount, skus)
+            is_multi = self.context_manager.is_item_multi_sku(item_id)
+
+            if is_multi:
+                # 多SKU商品：通过支付金额匹配对应规格，再从规格解析时长
+                duration_days = self._calculate_duration(paid_amount, skus)
+            else:
+                # 单SKU商品：按支付价格区间匹配时长
+                duration_days = self._match_duration_by_price(paid_amount)
 
             if not duration_days:
                 logger.error(f"无法根据支付金额 {paid_amount} 计算时长")
@@ -473,6 +480,31 @@ class XianyuLive:
 
         except Exception as e:
             logger.error(f"处理自动发货时发生错误: {str(e)}")
+
+    # 单SKU商品价格区间 → 时长（天）映射
+    SINGLE_SKU_PRICE_DURATION = [
+        (8, 9, 30),      # 8~9元 → 30天
+        (38, 40, 180),    # 38~40元 → 180天
+        (58, 60, 365),    # 58~60元 → 365天
+    ]
+
+    def _match_duration_by_price(self, paid_amount):
+        """单SKU商品：根据支付价格区间匹配时长（天数）"""
+        for min_price, max_price, days in self.SINGLE_SKU_PRICE_DURATION:
+            if min_price <= paid_amount <= max_price:
+                return days
+        logger.warning(f"单SKU商品支付金额 {paid_amount} 未命中任何价格区间")
+        return None
+
+    def _log_unmatched_message(self, message, item_id, user_id):
+        """记录未命中规则的用户消息到日志文件，便于后期优化规则"""
+        try:
+            log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unmatched_messages.log")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{timestamp}] item={item_id} user={user_id} msg={message}\n")
+        except Exception as e:
+            logger.error(f"记录未匹配消息失败: {e}")
 
     def _calculate_duration(self, paid_amount, skus):
         """根据支付金额和SKU计算购买时长（天数）"""
@@ -526,9 +558,12 @@ class XianyuLive:
             api_key = os.getenv("TOKEN_API_KEY", "your_api_key_here")
             logger.debug(f"api_url:{api_url}")
             logger.debug(f"api_key:{api_key}")
+
+            # action 作为 URL 查询参数，不放在 body 中
+            url = f"{api_url}?action=create_token"
+
             payload = {
-                "action": "create_token",
-                "playlist_ids": [2],
+                "playlist_ids": [4],
                 "expire_days": expire_days,
                 "channel": "xianyu_auto",
                 "max_ip_per_day": 4
@@ -539,7 +574,7 @@ class XianyuLive:
                 "Content-Type": "application/json"
             }
 
-            response = requests.post(api_url, json=payload, headers=headers, timeout=30)
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
             result = response.json()
 
             if result.get("success") or result.get("code") == 0:
@@ -563,8 +598,10 @@ class XianyuLive:
             api_url = os.getenv("TOKEN_API_URL", "http://localhost:8100/api.php")
             api_key = os.getenv("TOKEN_API_KEY", "your_api_key_here")
 
+            # action 作为 URL 查询参数，不放在 body 中
+            url = f"{api_url}?action=create_token"
+
             payload = {
-                "action": "update_token",
                 "token": token,
                 "add_days": add_days,
                 "status": 1
@@ -575,7 +612,7 @@ class XianyuLive:
                 "Content-Type": "application/json"
             }
 
-            response = requests.post(api_url, json=payload, headers=headers, timeout=30)
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
             result = response.json()
 
             if result.get("success") or result.get("code") == 0:
@@ -776,8 +813,8 @@ okhttp/3.12.1"""
                     # 自动发货处理
                     await self.handle_auto_delivery(message, user_id)
                     return
-            except Exception as e:
-                logger.error(f"处理消息时发生异常: {e}", exc_info=True)
+            except:
+                pass
 
             # 判断消息类型
             if self.is_typing_status(message):
@@ -893,6 +930,9 @@ okhttp/3.12.1"""
                         await asyncio.sleep(0.5)  # 多条消息间间隔 0.5 秒
 
                 return
+
+            # 记录未命中规则的消息，便于后期优化规则
+            self._log_unmatched_message(send_message, item_id, send_user_id)
 
             # 生成回复
             bot_reply = bot.generate_reply(
